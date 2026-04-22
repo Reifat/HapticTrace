@@ -1,0 +1,10 @@
+# Direct runtime dependencies for the desktop application.
+requests
+numpy
+scipy
+Pillow
+matplotlib
+pyobjc
+pyobjc-framework-AVFoundation
+pyobjc-framework-Quartz
+pyobjc-framework-CoreMediaIO

@@ -1,0 +1,5 @@
+# Development and test dependencies layered on top of runtime requirements.
+-r runtime.in
+
+# Test tooling
+pytest

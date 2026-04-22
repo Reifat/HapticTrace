@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "HapticTrace",
+      "type": "python",
+      "request": "launch",
+      "module": "app",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.vscode/.env",
+      "preLaunchTask": "Bootstrap .venv",
+      "args": [
+        "--url",
+        "http://192.168.1.67:8080"
+      ]
+    },
+    {
+      "name": "HapticTrace (custom args)",
+      "type": "python",
+      "request": "launch",
+      "module": "app",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.vscode/.env",
+      "preLaunchTask": "Bootstrap .venv",
+      "args": []
+    },
+    {
+      "name": "Pytest: app/tests",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.vscode/.env",
+      "preLaunchTask": "Bootstrap .venv (dev)",
+      "args": [
+        "app/tests",
+        "-q"
+      ]
+    }
+  ]
+}

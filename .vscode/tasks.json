@@ -1,0 +1,73 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Bootstrap .venv",
+      "type": "shell",
+      "command": "./run_app.sh",
+      "args": [
+        "--bootstrap-profile",
+        "runtime",
+        "--help"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "never",
+        "panel": "shared",
+        "clear": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Bootstrap .venv (dev)",
+      "type": "shell",
+      "command": "./run_app.sh",
+      "args": [
+        "--bootstrap-profile",
+        "dev",
+        "--help"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "never",
+        "panel": "shared",
+        "clear": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run HapticTrace",
+      "type": "shell",
+      "command": "./run_app.sh",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run app tests",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": [
+        "-m",
+        "pytest",
+        "app/tests",
+        "-q"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}",
+          "XDG_CACHE_HOME": "${workspaceFolder}/.venv/.cache",
+          "MPLCONFIGDIR": "${workspaceFolder}/.venv/.cache/matplotlib"
+        }
+      },
+      "dependsOn": "Bootstrap .venv (dev)",
+      "problemMatcher": []
+    }
+  ]
+}

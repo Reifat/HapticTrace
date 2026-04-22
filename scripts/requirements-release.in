@@ -1,0 +1,2 @@
+# Python tooling used only for producing macOS release bundles.
+py2app

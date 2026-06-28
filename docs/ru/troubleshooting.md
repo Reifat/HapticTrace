@@ -48,10 +48,12 @@
 
 Проверьте:
 
+- в `System Settings > Privacy & Security > Camera` разрешен доступ для `HapticTrace`
 - устройство переподключено
 - другие приложения, использующие capture stack, закрыты
 - подключение заново открыто из `HapticTrace`
 - выбран режим с видео
+- runtime-лог `~/Library/Logs/HapticTrace/HapticTrace.log` содержит строку `First iPhone video frame received`
 
 ### Видео не начинает записываться
 
@@ -69,6 +71,8 @@
 - нет системных разрешений macOS
 - для устройства недоступен capture stack
 - macOS некорректно видит устройство
+
+Если окно показывает `connected; waiting for video frames`, соединение с устройством создано, но первый кадр еще не пришел. В этом случае сначала проверьте разрешение Camera для `HapticTrace`, затем runtime-лог `~/Library/Logs/HapticTrace/HapticTrace.log`.
 
 ## Синхронизация
 

@@ -1,9 +1,9 @@
 # Direct runtime dependencies for the desktop application.
 requests
-numpy
-scipy
-Pillow
-matplotlib
+numpy==1.26.4
+scipy==1.13.1
+Pillow==12.2.0
+matplotlib==3.10.8
 pyobjc
 pyobjc-framework-AVFoundation
 pyobjc-framework-Quartz

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import tempfile
 import time
@@ -32,9 +33,17 @@ from app.platform.capture import IphoneCaptureService
 
 __all__ = ["HapticTraceApp"]
 
+logger = logging.getLogger(__name__)
+
 
 class HapticTraceApp:
-    def __init__(self, root: tk.Tk, base_url: str, autosave_dir: Path) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        base_url: str,
+        autosave_dir: Path,
+        runtime_log_path: Optional[Path] = None,
+    ) -> None:
         self.root = root
         self.root.title("HapticTrace")
         self.root.geometry("1100x920")
@@ -44,6 +53,7 @@ class HapticTraceApp:
 
         self.autosave_dir = autosave_dir
         self.autosave_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_log_path = runtime_log_path
 
         self.phyphox = PhyphoxService(base_url)
         self.capture = IphoneCaptureService()
@@ -80,6 +90,7 @@ class HapticTraceApp:
         self._playback_data_bounds: Optional[Tuple[float, float]] = None
         self.log_window = None
         self.log_text = None
+        self.last_log_text: Optional[str] = None
         self.connection_window = None
         self.connection_mode_combo = None
         self.connection_mode_note_var = tk.StringVar(value="")
@@ -157,6 +168,8 @@ class HapticTraceApp:
 
         self._build_ui()
         self._append_log("Приложение запущено")
+        if self.runtime_log_path is not None:
+            self._append_log(f"Runtime log: {self.runtime_log_path}")
         self._draw_empty_axes()
         self._schedule_update()
 
@@ -1138,15 +1151,28 @@ class HapticTraceApp:
         text = str(message).strip()
         if not text:
             return
-        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
-        if self.log_messages and self.log_messages[-1] == entry:
+        if text == self.last_log_text:
             return
+        self.last_log_text = text
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
+        logger.info(text)
         self.log_messages.append(entry)
         if self._has_live_log_widget():
+            should_scroll = self._is_log_scrolled_to_bottom()
             self.log_text.configure(state=tk.NORMAL)
             self.log_text.insert(tk.END, entry + "\n")
-            self.log_text.see(tk.END)
+            if should_scroll:
+                self.log_text.see(tk.END)
             self.log_text.configure(state=tk.DISABLED)
+
+    def _is_log_scrolled_to_bottom(self) -> bool:
+        if not self._has_live_log_widget():
+            return True
+        try:
+            _first, last = self.log_text.yview()
+            return last >= 0.999
+        except tk.TclError:
+            return True
 
     def _has_live_log_widget(self) -> bool:
         if self.log_text is None:
@@ -1173,14 +1199,23 @@ class HapticTraceApp:
         self._append_log(f"{title}: {message}")
         messagebox.showinfo(title, message)
 
-    def _refresh_log_window(self) -> None:
+    def _refresh_log_window(self, scroll_to_end: bool = True) -> None:
         if not self._has_live_log_widget():
             return
+        try:
+            first, last = self.log_text.yview()
+            was_at_bottom = last >= 0.999
+        except tk.TclError:
+            first = 0.0
+            was_at_bottom = True
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         if self.log_messages:
             self.log_text.insert(tk.END, "\n".join(self.log_messages) + "\n")
-        self.log_text.see(tk.END)
+        if scroll_to_end or was_at_bottom:
+            self.log_text.see(tk.END)
+        else:
+            self.log_text.yview_moveto(first)
         self.log_text.configure(state=tk.DISABLED)
 
     def open_log_window(self) -> None:
@@ -1217,7 +1252,7 @@ class HapticTraceApp:
         self.log_text = tk.Text(text_frame, wrap=tk.WORD, state=tk.DISABLED, yscrollcommand=scrollbar.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.configure(command=self.log_text.yview)
-        self._refresh_log_window()
+        self._refresh_log_window(scroll_to_end=True)
 
         def close_window() -> None:
             self.log_text = None
@@ -2050,17 +2085,29 @@ class HapticTraceApp:
         )
         self._set_status_value(self.exp_status_var, self.phyphox.experiment_status, "Experiment")
         self._set_status_value(self.sensor_var, self.phyphox.sensor_status, "Sensors")
-        self._set_status_value(self.capture_status_var, self.capture.status_text, "Capture")
+        capture_status = self.capture.status_text
+        if self.capture.connected:
+            if self.capture.shared_state.last_frame_shape is None:
+                capture_status = "iPhone capture: connected; waiting for video frames"
+            else:
+                capture_status = "iPhone capture: receiving video"
+        self._set_status_value(self.capture_status_var, capture_status, "Capture")
         self._set_status_value(self.device_status_var, self.capture.device_text, "Device")
         recording_state = "running" if (self.phyphox.is_measuring or self.capture.shared_state.recorder.recording) else "stopped"
         self._set_status_value(self.record_var, f"Recording: {recording_state} | mode={self._describe_record_targets()}", "Recording")
         info_parts = [self.phyphox.info_text]
         if self.capture.shared_state.last_frame_shape is not None:
             height, width = self.capture.shared_state.last_frame_shape[:2]
-            info_parts.append(f"Capture {width}x{height} | fps={self.capture.shared_state.last_fps:.1f}")
+            info_parts.append(
+                f"Capture {width}x{height} | "
+                f"input={self.capture.shared_state.last_fps:.1f} fps | "
+                f"preview={self.video_window.live_preview_fps:.1f} fps"
+            )
+        elif self.capture.connected:
+            info_parts.append("Capture waiting for video frames")
         info_parts.append(self.video_window.offset_summary_var.get())
-        self._set_status_value(self.info_var, " | ".join(part for part in info_parts if part), "Info")
-        self.video_window.set_capture_info(self.capture.status_text, self.capture.device_text)
+        self._set_status_value(self.info_var, " | ".join(part for part in info_parts if part))
+        self.video_window.set_capture_info(capture_status, self.capture.device_text)
 
     def _schedule_update(self) -> None:
         try:
@@ -2077,8 +2124,6 @@ class HapticTraceApp:
             if self.video_window.is_playback_mode():
                 self._sync_playback_view_range(clamp_cursor=False)
             self._refresh_action_buttons()
-            if self.log_window is not None and self.log_window.winfo_exists():
-                self._refresh_log_window()
             if self.interp_settings_window is not None and self.interp_settings_window.winfo_exists():
                 self._refresh_interpolation_source_stats()
         finally:

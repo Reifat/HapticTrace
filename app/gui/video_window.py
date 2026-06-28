@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from dataclasses import dataclass
 from queue import Empty
 from typing import Any, Dict, Optional, Tuple
@@ -18,6 +19,8 @@ from app.core.parsing import parse_optional_float
 from app.core.session import RecordingSession, UnifiedSessionController
 from app.gui.models import PlaybackState
 from app.platform.capture import AVFoundationPlaybackVideo, IphoneCaptureService, VideoClipMetadata, read_video_asset_info
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,6 +85,12 @@ class VideoWindowController:
         self.playback_last_requested_signature: Optional[Tuple[str, int, Tuple[int, int], bool, bool]] = None
         self.last_preview_present_mono = 0.0
         self.preview_min_interval_s = 0.0
+        self.live_preview_fps = 0.0
+        self.live_preview_frames_presented = 0
+        self.live_preview_fps_start_mono: Optional[float] = None
+        self.live_preview_render_ema_ms = 0.0
+        self.live_preview_prefer_speed = False
+        self.live_preview_quality_switch_mono = 0.0
         self.last_rendered_frame_index: Optional[int] = None
         self.last_rendered_view_size: Tuple[int, int] = (0, 0)
         self.cursor_notify_after_id = None
@@ -249,6 +258,14 @@ class VideoWindowController:
         self.last_rendered_frame_index = None
         self.last_rendered_view_size = (0, 0)
 
+    def _reset_live_preview_stats(self) -> None:
+        self.live_preview_fps = 0.0
+        self.live_preview_frames_presented = 0
+        self.live_preview_fps_start_mono = None
+        self.live_preview_render_ema_ms = 0.0
+        self.live_preview_prefer_speed = False
+        self.live_preview_quality_switch_mono = 0.0
+
     def _ensure_playback_decode_worker(self) -> None:
         if self.playback_decode_thread is not None and self.playback_decode_thread.is_alive():
             return
@@ -332,7 +349,8 @@ class VideoWindowController:
         self.playback_decode_last_consumed_request_id = result.request_id
         if result.error is not None:
             self.playback_last_requested_signature = None
-            self.capture.shared_state.last_error = result.error
+            logger.exception("Failed to decode playback video frame", exc_info=result.error)
+            self.capture.shared_state.report_error(result.error)
             self._stop_playback_loop()
             self._show_preview_text("Не удалось декодировать видео")
             return
@@ -427,11 +445,33 @@ class VideoWindowController:
         if previous_render_context != next_render_context:
             self._reset_render_cache()
 
-    def set_capture_info(self, _capture_status: str, _device_status: str) -> None:
-        return
+    def set_capture_info(self, capture_status: str, _device_status: str) -> None:
+        if self.closed or not self.is_live_preview_state():
+            return
+        if self.capture.shared_state.last_frame_shape is not None:
+            height, width = self.capture.shared_state.last_frame_shape[:2]
+            self.mode_var.set(
+                f"Video mode: live preview | {width}x{height} | "
+                f"capture {self.capture.shared_state.last_fps:.1f} fps | "
+                f"preview {self.live_preview_fps:.1f} fps"
+            )
+            return
+        self.mode_var.set(f"Video mode: live preview | {capture_status}")
+        if self.capture.connecting:
+            self._show_preview_text_if_changed("Connecting to iPhone...")
+        elif self.capture.connected:
+            self._show_preview_text_if_changed(
+                "Connected. Waiting for video frames...\n"
+                "If this does not change, check Camera permission for HapticTrace."
+            )
+        elif "error:" in capture_status:
+            self._show_preview_text_if_changed(capture_status)
+        else:
+            self._show_preview_text_if_changed("Ожидание live preview...")
 
     def activate_live_mode(self) -> None:
         self._transition_view_state(self.STATE_LIVE_PREVIEW)
+        self._reset_live_preview_stats()
         self.state.cursor_time_s = None
         self.state.duration_s = 0.0
         self.state.visible_start_s = 0.0
@@ -962,7 +1002,8 @@ class VideoWindowController:
         try:
             info = read_video_asset_info(clip.temp_path)
         except Exception as exc:
-            self.capture.shared_state.last_error = exc
+            logger.exception("Failed to read playback video metadata")
+            self.capture.shared_state.report_error(exc)
             return False
         self.playback_path = clip.temp_path
         fps_candidates = []
@@ -1000,6 +1041,16 @@ class VideoWindowController:
         self._reset_render_cache()
         self._update_preview_text_position()
 
+    def _show_preview_text_if_changed(self, text: str) -> None:
+        if self.preview_canvas is None or self.preview_text_item is None:
+            return
+        try:
+            if self.preview_canvas.itemcget(self.preview_text_item, "text") == text:
+                return
+        except tk.TclError:
+            return
+        self._show_preview_text(text)
+
     def _update_preview_text_position(self) -> None:
         if self.preview_canvas is None or self.preview_text_item is None:
             return
@@ -1014,6 +1065,66 @@ class VideoWindowController:
         if self.is_playback_mode() and self.state.cursor_time_s is not None:
             self._request_playback_render()
 
+    def _resize_for_preview(
+        self,
+        frame_image: Image.Image,
+        width: int,
+        height: int,
+        view_w: int,
+        view_h: int,
+        high_quality: bool,
+    ) -> Tuple[Image.Image, int, int]:
+        if width <= view_w and height <= view_h:
+            return frame_image, width, height
+        scale = min(view_w / max(width, 1), view_h / max(height, 1))
+        new_w = max(1, int(width * scale))
+        new_h = max(1, int(height * scale))
+        resampling = Image.Resampling if hasattr(Image, "Resampling") else Image
+        resample_filter = resampling.LANCZOS if high_quality else resampling.BILINEAR
+        return frame_image.resize((new_w, new_h), resample=resample_filter), new_w, new_h
+
+    def _choose_live_preview_prefer_speed(self) -> bool:
+        capture_fps = self.capture.shared_state.last_fps or 60.0
+        if capture_fps < 45.0:
+            return False
+        target_fps = min(max(capture_fps, 30.0), 60.0)
+        budget_ms = 1000.0 / target_fps
+        now = time.monotonic()
+        if self.live_preview_prefer_speed:
+            if (
+                self.live_preview_render_ema_ms > 0.0
+                and self.live_preview_render_ema_ms < budget_ms * 0.45
+                and (self.live_preview_fps <= 0.0 or self.live_preview_fps >= capture_fps * 0.90)
+                and now - self.live_preview_quality_switch_mono > 2.0
+            ):
+                self.live_preview_prefer_speed = False
+                self.live_preview_quality_switch_mono = now
+            return self.live_preview_prefer_speed
+        if (
+            self.live_preview_render_ema_ms > budget_ms * 0.75
+            or (self.live_preview_fps > 0.0 and self.live_preview_fps < capture_fps * 0.82)
+        ) and now - self.live_preview_quality_switch_mono > 1.0:
+            self.live_preview_prefer_speed = True
+            self.live_preview_quality_switch_mono = now
+        return self.live_preview_prefer_speed
+
+    def _note_live_preview_presented(self, render_elapsed_s: float) -> None:
+        now = time.monotonic()
+        elapsed_ms = max(render_elapsed_s * 1000.0, 0.0)
+        if self.live_preview_render_ema_ms <= 0.0:
+            self.live_preview_render_ema_ms = elapsed_ms
+        else:
+            self.live_preview_render_ema_ms = self.live_preview_render_ema_ms * 0.85 + elapsed_ms * 0.15
+        if self.live_preview_fps_start_mono is None:
+            self.live_preview_fps_start_mono = now
+            self.live_preview_frames_presented = 0
+        self.live_preview_frames_presented += 1
+        window_elapsed = now - self.live_preview_fps_start_mono
+        if window_elapsed >= 1.0:
+            self.live_preview_fps = self.live_preview_frames_presented / window_elapsed
+            self.live_preview_frames_presented = 0
+            self.live_preview_fps_start_mono = now
+
     def _render_frame(self, frame_bgra: np.ndarray, prefer_speed: bool = False) -> None:
         if self.preview_canvas is None or self.preview_image_item is None or self.preview_text_item is None:
             return
@@ -1022,22 +1133,15 @@ class VideoWindowController:
         if prefer_speed:
             working_frame = frame_bgra
             height, width = working_frame.shape[:2]
-            if width > 0 and height > 0:
-                source_ratio = max(width / max(view_w, 1), height / max(view_h, 1))
-                if source_ratio >= 2.0:
-                    step = max(1, int(source_ratio))
-                    working_frame = np.ascontiguousarray(working_frame[::step, ::step, :])
-                    height, width = working_frame.shape[:2]
             frame_image = Image.frombuffer("RGBA", (width, height), working_frame, "raw", "BGRA", 0, 1)
-            if width <= view_w and height <= view_h:
-                new_w, new_h = width, height
-                display_image = frame_image
-            else:
-                scale = min(view_w / width, view_h / height)
-                new_w = max(1, int(width * scale))
-                new_h = max(1, int(height * scale))
-                resampling = Image.Resampling if hasattr(Image, "Resampling") else Image
-                display_image = frame_image.resize((new_w, new_h), resample=resampling.BOX)
+            display_image, new_w, new_h = self._resize_for_preview(
+                frame_image,
+                width,
+                height,
+                view_w,
+                view_h,
+                high_quality=False,
+            )
             if (
                 self.preview_image is None
                 or self.preview_image_size != (new_w, new_h)
@@ -1051,21 +1155,27 @@ class VideoWindowController:
                 self.preview_image.paste(display_image)
         else:
             height, width = frame_bgra.shape[:2]
-            frame_rgb = np.ascontiguousarray(frame_bgra[:, :, [2, 1, 0]])
-            frame_image = Image.fromarray(frame_rgb, mode="RGB")
-            if width <= view_w and height <= view_h:
-                new_w, new_h = width, height
-                display_image = frame_image
+            working_frame = np.ascontiguousarray(frame_bgra)
+            frame_image = Image.frombuffer("RGBA", (width, height), working_frame, "raw", "BGRA", 0, 1)
+            display_image, new_w, new_h = self._resize_for_preview(
+                frame_image,
+                width,
+                height,
+                view_w,
+                view_h,
+                high_quality=True,
+            )
+            if (
+                self.preview_image is None
+                or self.preview_image_size != (new_w, new_h)
+                or self.preview_image_fast_path is not False
+            ):
+                self.preview_image = ImageTk.PhotoImage(display_image)
+                self.preview_image_size = (new_w, new_h)
+                self.preview_image_fast_path = False
+                self.preview_canvas.itemconfigure(self.preview_image_item, image=self.preview_image)
             else:
-                scale = min(view_w / width, view_h / height)
-                new_w = max(1, int(width * scale))
-                new_h = max(1, int(height * scale))
-                resampling = Image.Resampling if hasattr(Image, "Resampling") else Image
-                display_image = frame_image.resize((new_w, new_h), resample=resampling.BILINEAR)
-            self.preview_image = ImageTk.PhotoImage(display_image)
-            self.preview_image_size = (new_w, new_h)
-            self.preview_image_fast_path = False
-            self.preview_canvas.itemconfigure(self.preview_image_item, image=self.preview_image)
+                self.preview_image.paste(display_image)
         x = (view_w - new_w) // 2
         y = (view_h - new_h) // 2
         self.preview_canvas.coords(self.preview_image_item, x, y)
@@ -1161,7 +1271,10 @@ class VideoWindowController:
         if now - self.last_preview_present_mono < self.preview_min_interval_s:
             return
         self.last_preview_present_mono = now
-        self._render_frame(frame_bgra, prefer_speed=True)
+        prefer_speed = self._choose_live_preview_prefer_speed()
+        render_start = time.perf_counter()
+        self._render_frame(frame_bgra, prefer_speed=prefer_speed)
+        self._note_live_preview_presented(time.perf_counter() - render_start)
 
     def _show_error(self, title: str, message: str) -> None:
         messagebox.showerror(title, message)
@@ -1172,6 +1285,7 @@ class VideoWindowController:
         if self.capture.shared_state.last_error is not None:
             err = self.capture.shared_state.last_error
             self.capture.shared_state.last_error = None
+            logger.warning("Capture/playback error shown to user: %s", err)
             self._show_error("Capture error", str(err))
         self._consume_playback_decode_result()
         frame_bgra = None

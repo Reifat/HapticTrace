@@ -1,4 +1,4 @@
-[Русская версия](./../ru/troubleshooting.md.md)
+[Русская версия](./../ru/troubleshooting.md)
 
 # Troubleshooting
 
@@ -48,10 +48,12 @@ Check:
 
 Check:
 
+- Camera access is enabled for `HapticTrace` in `System Settings > Privacy & Security > Camera`
 - the device was reconnected
 - other applications using the capture stack are closed
 - the connection was reopened from `HapticTrace`
 - a video-enabled mode is selected
+- the runtime log `~/Library/Logs/HapticTrace/HapticTrace.log` contains `First iPhone video frame received`
 
 ### Video does not start recording
 
@@ -69,6 +71,8 @@ The cause is usually one of the following:
 - missing macOS permissions
 - capture stack is unavailable for the device
 - macOS does not see the device correctly
+
+If the window shows `connected; waiting for video frames`, the device connection was created but the first frame has not arrived yet. Check Camera permission for `HapticTrace` first, then inspect `~/Library/Logs/HapticTrace/HapticTrace.log`.
 
 ## Synchronization
 

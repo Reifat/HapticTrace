@@ -139,17 +139,19 @@ Release-сборка создает:
 - `build/release/compliance/sbom.runtime.cdx.json` — SBOM финального app bundle
 - `build/release/requirements/` — runtime manifest-файлы и lockfile-файлы, использованные в релизе
 - `build/release/scripts/` — release script и pinned inputs для tooling
-- `build/HapticTrace-macos-release.zip` — упакованный release-архив
+- `build/HapticTrace-macos-<arch>-release.zip` — упакованный release-архив для архитектуры машины сборки
 
 ## Codesign
 
-По умолчанию bundle подписывается ad-hoc подписью.
+Переносимые release-сборки требуют Developer ID signing identity.
 
 Чтобы использовать конкретный signing identity, перед запуском release-скрипта задайте:
 
 ```bash
 HAPTIC_CODESIGN_IDENTITY=<your_identity>
 ```
+
+Для локальных smoke-сборок задайте `HAPTIC_ALLOW_ADHOC=1`, чтобы явно разрешить ad-hoc подпись.
 
 ## SBOM и release tooling
 

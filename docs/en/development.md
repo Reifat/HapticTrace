@@ -139,11 +139,11 @@ The release build produces:
 - `build/release/compliance/sbom.runtime.cdx.json` — SBOM for the final app bundle
 - `build/release/requirements/` — runtime manifests and lockfiles used for the release
 - `build/release/scripts/` — release script and pinned tooling inputs
-- `build/HapticTrace-macos-release.zip` — packaged release archive
+- `build/HapticTrace-macos-<arch>-release.zip` — packaged release archive for the host architecture
 
 ## Codesign
 
-By default, the bundle is signed with an ad-hoc signature.
+Portable release bundles require a Developer ID signing identity.
 
 To use a specific signing identity, set:
 
@@ -152,6 +152,8 @@ HAPTIC_CODESIGN_IDENTITY=<your_identity>
 ```
 
 before running the release script.
+
+For local-only smoke builds, set `HAPTIC_ALLOW_ADHOC=1` to permit an ad-hoc signature.
 
 ## SBOM and release tooling
 

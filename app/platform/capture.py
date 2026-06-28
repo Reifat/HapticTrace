@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import logging
 import shutil
 import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,7 @@ from PIL import Image
 from app.core.contracts import SessionTrackerProtocol
 from app.core.parsing import parse_optional_float, parse_optional_int
 
+logger = logging.getLogger(__name__)
 
 coremediaio_path = ctypes.util.find_library("CoreMediaIO")
 if not coremediaio_path:
@@ -141,6 +144,107 @@ def find_iphone_device(timeout: float = 20.0):
     return None
 
 
+def authorization_status_name(status: int) -> str:
+    names = {
+        AVF.AVAuthorizationStatusAuthorized: "authorized",
+        AVF.AVAuthorizationStatusDenied: "denied",
+        AVF.AVAuthorizationStatusNotDetermined: "not_determined",
+        AVF.AVAuthorizationStatusRestricted: "restricted",
+    }
+    return names.get(int(status), f"unknown({status})")
+
+
+def ensure_camera_access(timeout: float = 60.0) -> None:
+    status = AVF.AVCaptureDevice.authorizationStatusForMediaType_(AVF.AVMediaTypeVideo)
+    logger.info("Camera permission status: %s", authorization_status_name(status))
+    if status == AVF.AVAuthorizationStatusAuthorized:
+        return
+    if status in (AVF.AVAuthorizationStatusDenied, AVF.AVAuthorizationStatusRestricted):
+        raise RuntimeError(
+            "macOS Camera permission is not available for HapticTrace. "
+            "Enable it in System Settings > Privacy & Security > Camera."
+        )
+    if status != AVF.AVAuthorizationStatusNotDetermined:
+        raise RuntimeError(f"Unexpected macOS Camera permission status: {authorization_status_name(status)}")
+
+    event = threading.Event()
+    granted_holder = {"granted": False}
+
+    def completion_handler(granted) -> None:
+        granted_holder["granted"] = bool(granted)
+        event.set()
+
+    logger.info("Requesting macOS Camera permission")
+    AVF.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+        AVF.AVMediaTypeVideo,
+        completion_handler,
+    )
+    loop = NSRunLoop.currentRunLoop()
+    deadline = time.time() + timeout
+    while time.time() < deadline and not event.is_set():
+        loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+    if not event.is_set():
+        raise RuntimeError("Timed out while waiting for the macOS Camera permission prompt")
+    if not granted_holder["granted"]:
+        raise RuntimeError(
+            "macOS Camera permission was denied. "
+            "Enable HapticTrace in System Settings > Privacy & Security > Camera."
+        )
+    logger.info("Camera permission granted")
+
+
+def fourcc(value: int) -> str:
+    try:
+        return int(value).to_bytes(4, "big").decode("macroman")
+    except Exception:
+        return str(value)
+
+
+def device_media_types(dev) -> List[str]:
+    media_types = []
+    for label, media_type in [
+        ("video", AVF.AVMediaTypeVideo),
+        ("muxed", AVF.AVMediaTypeMuxed),
+        ("audio", AVF.AVMediaTypeAudio),
+    ]:
+        try:
+            if dev.hasMediaType_(media_type):
+                media_types.append(label)
+        except Exception:
+            pass
+    return media_types
+
+
+def configure_connection_frame_rate(connection, fps: float = 60.0) -> None:
+    if connection is None:
+        return
+    frame_duration = CoreMedia.CMTimeMake(1, max(1, int(round(float(fps)))))
+    configured = []
+    try:
+        if connection.isVideoMinFrameDurationSupported():
+            connection.setVideoMinFrameDuration_(frame_duration)
+            configured.append("min")
+    except Exception:
+        logger.debug("Video min frame duration is not configurable", exc_info=True)
+    try:
+        if connection.isVideoMaxFrameDurationSupported():
+            connection.setVideoMaxFrameDuration_(frame_duration)
+            configured.append("max")
+    except Exception:
+        logger.debug("Video max frame duration is not configurable", exc_info=True)
+    if configured:
+        logger.info("Requested capture connection %s frame duration at %.1f fps", "/".join(configured), fps)
+
+
+def samplebuffer_image_shape(sample_buffer) -> Optional[Tuple[int, int, int]]:
+    image_buffer = AVF.CMSampleBufferGetImageBuffer(sample_buffer)
+    if image_buffer is None:
+        return None
+    width = int(Quartz.CVPixelBufferGetWidth(image_buffer))
+    height = int(Quartz.CVPixelBufferGetHeight(image_buffer))
+    return (height, width, 4)
+
+
 def samplebuffer_to_bgra(sample_buffer):
     image_buffer = AVF.CMSampleBufferGetImageBuffer(sample_buffer)
     if image_buffer is None:
@@ -150,9 +254,20 @@ def samplebuffer_to_bgra(sample_buffer):
         width = Quartz.CVPixelBufferGetWidth(image_buffer)
         height = Quartz.CVPixelBufferGetHeight(image_buffer)
         bytes_per_row = Quartz.CVPixelBufferGetBytesPerRow(image_buffer)
+        pixel_format = Quartz.CVPixelBufferGetPixelFormatType(image_buffer)
         base_address = Quartz.CVPixelBufferGetBaseAddress(image_buffer)
         if base_address is None:
             return None
+        if bytes_per_row < width * 4:
+            raise RuntimeError(
+                f"Unexpected pixel buffer row size: width={width}, height={height}, "
+                f"bytes_per_row={bytes_per_row}, format={fourcc(pixel_format)!r}"
+            )
+        if bytes_per_row % 4 != 0:
+            raise RuntimeError(
+                f"Unsupported pixel buffer row alignment: bytes_per_row={bytes_per_row}, "
+                f"format={fourcc(pixel_format)!r}"
+            )
         mv = base_address.as_buffer(bytes_per_row * height)
         arr = np.frombuffer(mv, dtype=np.uint8).reshape((height, bytes_per_row // 4, 4))
         return arr[:, :width, :].copy()
@@ -412,7 +527,7 @@ class AVFoundationPlaybackVideo:
         working_frame = np.ascontiguousarray(frame_bgra)
         frame_image = Image.frombuffer("RGBA", (width, height), working_frame, "raw", "BGRA", 0, 1)
         resampling = getattr(Image, "Resampling", Image)
-        resized_image = frame_image.resize((target_width, target_height), resample=resampling.NEAREST)
+        resized_image = frame_image.resize((target_width, target_height), resample=resampling.LANCZOS)
         resized_bgra = resized_image.tobytes("raw", "BGRA")
         return np.frombuffer(resized_bgra, dtype=np.uint8).copy().reshape((target_height, target_width, 4))
 
@@ -454,8 +569,15 @@ class VideoClipMetadata:
     duration_s: Optional[float] = None
 
 
+def _target_video_bitrate(width: int, height: int, fps_hint: float) -> int:
+    pixels_per_second = max(1, int(width)) * max(1, int(height)) * min(max(float(fps_hint), 24.0), 60.0)
+    target = int(pixels_per_second * 0.16)
+    return min(max(target, 12_000_000), 80_000_000)
+
+
 def _build_asset_writer_settings(
     frame_size: Tuple[int, int],
+    fps_hint: float,
     writer_settings: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     width, height = frame_size
@@ -468,6 +590,20 @@ def _build_asset_writer_settings(
     normalized[AVF.AVVideoCodecKey] = normalized.get(AVF.AVVideoCodecKey) or AVF.AVVideoCodecTypeH264
     normalized[AVF.AVVideoWidthKey] = int(width)
     normalized[AVF.AVVideoHeightKey] = int(height)
+    compression_raw = normalized.get(AVF.AVVideoCompressionPropertiesKey)
+    compression: Dict[str, object] = {}
+    if isinstance(compression_raw, dict):
+        compression.update(compression_raw)
+    target_bitrate = _target_video_bitrate(width, height, fps_hint)
+    current_bitrate = parse_optional_int(compression.get(AVF.AVVideoAverageBitRateKey))
+    if current_bitrate is None or current_bitrate < target_bitrate:
+        compression[AVF.AVVideoAverageBitRateKey] = target_bitrate
+    effective_fps = max(1, int(round(float(fps_hint or 30.0))))
+    compression[AVF.AVVideoExpectedSourceFrameRateKey] = effective_fps
+    compression[AVF.AVVideoMaxKeyFrameIntervalKey] = max(effective_fps * 2, 1)
+    compression[AVF.AVVideoProfileLevelKey] = AVF.AVVideoProfileLevelH264HighAutoLevel
+    compression[AVF.AVVideoAllowFrameReorderingKey] = False
+    normalized[AVF.AVVideoCompressionPropertiesKey] = compression
     return normalized
 
 
@@ -507,7 +643,14 @@ class Recorder:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.temp_path = str(tmp_dir / f"iphone_capture_{stamp}.mp4")
             Path(self.temp_path).unlink(missing_ok=True)
-            video_settings = _build_asset_writer_settings(self.frame_size, writer_settings)
+            video_settings = _build_asset_writer_settings(self.frame_size, self.fps, writer_settings)
+            logger.info(
+                "Video recording settings: %sx%s fps=%.1f bitrate=%s",
+                width,
+                height,
+                self.fps,
+                video_settings.get(AVF.AVVideoCompressionPropertiesKey, {}).get(AVF.AVVideoAverageBitRateKey),
+            )
             writer, err = AVF.AVAssetWriter.alloc().initWithURL_fileType_error_(
                 build_file_url(self.temp_path),
                 AVF.AVFileTypeMPEG4,
@@ -770,8 +913,16 @@ class SharedState:
         self.last_frame_shape = None
         self.capture_started = False
         self.last_error: Optional[Exception] = None
+        self.last_error_text = ""
+        self.last_error_ts = 0.0
         self.frames_total = 0
         self.start_ts: Optional[float] = None
+        self.first_frame_wall_ts: Optional[float] = None
+        self.last_frame_wall_ts: Optional[float] = None
+        self.last_frame_interval_s = 0.0
+        self.frame_timestamps = deque(maxlen=180)
+        self.preview_dropped_frames = 0
+        self.empty_sample_buffers = 0
         self.last_fps = 0.0
         self.lock = threading.Lock()
         self.session_tracker: Optional[SessionTrackerProtocol] = None
@@ -780,25 +931,79 @@ class SharedState:
         self.session_tracker = tracker
 
     def push_preview(self, frame_bgra: np.ndarray) -> None:
+        dropped_frames = 0
         try:
             while True:
                 self.preview_queue.get_nowait()
+                dropped_frames += 1
         except Empty:
             pass
+        if dropped_frames:
+            with self.lock:
+                self.preview_dropped_frames += dropped_frames
         try:
             self.preview_queue.put_nowait(frame_bgra)
         except Exception:
             pass
 
+    def wants_preview_frame(self) -> bool:
+        if self.preview_queue.empty():
+            return True
+        with self.lock:
+            self.preview_dropped_frames += 1
+        return False
+
+    def report_error(self, exc: Exception, throttle_s: float = 0.0) -> None:
+        text = str(exc)
+        now = time.time()
+        with self.lock:
+            if throttle_s > 0.0 and text == self.last_error_text and now - self.last_error_ts < throttle_s:
+                return
+            self.last_error = exc
+            self.last_error_text = text
+            self.last_error_ts = now
+
+    def note_empty_sample_buffer(self) -> None:
+        with self.lock:
+            self.empty_sample_buffers += 1
+
     def update_fps(self) -> None:
         with self.lock:
             self.frames_total += 1
+            now = time.time()
+            if self.first_frame_wall_ts is None:
+                self.first_frame_wall_ts = now
+            if self.last_frame_wall_ts is not None:
+                self.last_frame_interval_s = max(now - self.last_frame_wall_ts, 0.0)
+            self.last_frame_wall_ts = now
+            self.frame_timestamps.append(now)
             if self.start_ts is None:
-                self.start_ts = time.time()
+                self.start_ts = now
                 return
-            elapsed = time.time() - self.start_ts
+            if len(self.frame_timestamps) >= 2:
+                elapsed = self.frame_timestamps[-1] - self.frame_timestamps[0]
+                frame_count = len(self.frame_timestamps) - 1
+            else:
+                elapsed = now - self.start_ts
+                frame_count = self.frames_total
             if elapsed > 0:
-                self.last_fps = self.frames_total / elapsed
+                self.last_fps = frame_count / elapsed
+
+    def reset_stream_stats(self) -> None:
+        with self.lock:
+            self.last_frame_shape = None
+            self.last_fps = 0.0
+            self.frames_total = 0
+            self.start_ts = None
+            self.first_frame_wall_ts = None
+            self.last_frame_wall_ts = None
+            self.last_frame_interval_s = 0.0
+            self.frame_timestamps.clear()
+            self.preview_dropped_frames = 0
+            self.empty_sample_buffers = 0
+            self.last_error = None
+            self.last_error_text = ""
+            self.last_error_ts = 0.0
 
 
 class VideoDelegate(NSObject):
@@ -808,40 +1013,57 @@ class VideoDelegate(NSObject):
             return None
         self.shared_state = shared_state
         self.last_report_ts = time.time()
+        self.last_empty_report_ts = 0.0
         return self
 
     def captureOutput_didOutputSampleBuffer_fromConnection_(self, output, sampleBuffer, connection) -> None:
         try:
-            frame_bgra = samplebuffer_to_bgra(sampleBuffer)
-            if frame_bgra is None:
+            frame_shape = samplebuffer_image_shape(sampleBuffer)
+            if frame_shape is None:
+                self.shared_state.note_empty_sample_buffer()
+                now = time.time()
+                if now - self.last_empty_report_ts >= 5.0:
+                    logger.warning("Capture delivered sample buffers without image buffers")
+                    self.last_empty_report_ts = now
                 return
             frame_wall_ts = time.time()
-            self.shared_state.last_frame_shape = frame_bgra.shape
+            first_frame = self.shared_state.first_frame_wall_ts is None
+            self.shared_state.last_frame_shape = frame_shape
             self.shared_state.update_fps()
-            self.shared_state.push_preview(frame_bgra)
+            if first_frame:
+                height, width = frame_shape[:2]
+                logger.info("First iPhone video frame received: %sx%s", width, height)
             if self.shared_state.recorder.recording:
                 wrote_frame = self.shared_state.recorder.append_sample_buffer(sampleBuffer, frame_wall_ts=frame_wall_ts)
                 if wrote_frame and self.shared_state.session_tracker is not None:
                     self.shared_state.session_tracker.mark_video_frame(frame_wall_ts)
+            if self.shared_state.wants_preview_frame():
+                frame_bgra = samplebuffer_to_bgra(sampleBuffer)
+                if frame_bgra is not None:
+                    self.shared_state.last_frame_shape = frame_bgra.shape
+                    self.shared_state.push_preview(frame_bgra)
             now = time.time()
             if now - self.last_report_ts >= 1.0:
-                height, width = frame_bgra.shape[:2]
-                print(f"{width}x{height} | fps={self.shared_state.last_fps:.1f}")
+                height, width = frame_shape[:2]
+                logger.debug("iPhone video stream: %sx%s | fps=%.1f", width, height, self.shared_state.last_fps)
                 self.last_report_ts = now
         except Exception as exc:
-            self.shared_state.last_error = exc
+            logger.exception("Failed to process iPhone capture sample buffer")
+            self.shared_state.report_error(exc, throttle_s=5.0)
 
 
 class IphoneCaptureService:
     def __init__(self) -> None:
         self.shared_state = SharedState()
         self.session = None
+        self.input = None
         self.output = None
         self.delegate = None
         self.queue = None
         self.capture_thread: Optional[threading.Thread] = None
         self.connected = False
         self.connecting = False
+        self.connected_wall_ts: Optional[float] = None
         self.status_text = "iPhone capture: disconnected"
         self.device_text = "iPhone device: unknown"
 
@@ -853,23 +1075,41 @@ class IphoneCaptureService:
             return False
         self.connecting = True
         self.status_text = "iPhone capture: connecting..."
+        self.shared_state.reset_stream_stats()
         self.capture_thread = threading.Thread(target=self._connect_worker, daemon=True)
         self.capture_thread.start()
         return True
 
     def _connect_worker(self) -> None:
         try:
+            logger.info("Starting iPhone capture connection")
             enable_screen_devices()
+            logger.info("CoreMediaIO screen capture devices enabled")
+            ensure_camera_access()
             device = find_iphone_device(timeout=20.0)
             if device is None:
                 raise RuntimeError("iPhone/iPad capture device not found")
+            logger.info(
+                "Selected capture device: name=%s unique_id=%s model_id=%s media=%s",
+                safe_str(device.localizedName()),
+                safe_str(device.uniqueID()),
+                safe_str(device.modelID()) if hasattr(device, "modelID") else "",
+                ",".join(device_media_types(device)) or "unknown",
+            )
+            self.status_text = "iPhone capture: device found; starting session"
             self.session = AVF.AVCaptureSession.alloc().init()
+            for preset in (AVF.AVCaptureSessionPresetInputPriority, AVF.AVCaptureSessionPresetHigh):
+                if self.session.canSetSessionPreset_(preset):
+                    self.session.setSessionPreset_(preset)
+                    logger.info("Capture session preset: %s", safe_str(preset))
+                    break
             inp, err = AVF.AVCaptureDeviceInput.deviceInputWithDevice_error_(device, None)
             if inp is None:
                 raise RuntimeError(f"Cannot create AVCaptureDeviceInput: {err}")
             if not self.session.canAddInput_(inp):
                 raise RuntimeError("Cannot add input to session")
             self.session.addInput_(inp)
+            self.input = inp
             self.output = AVF.AVCaptureVideoDataOutput.alloc().init()
             self.output.setAlwaysDiscardsLateVideoFrames_(True)
             self.output.setVideoSettings_({
@@ -881,15 +1121,36 @@ class IphoneCaptureService:
             if not self.session.canAddOutput_(self.output):
                 raise RuntimeError("Cannot add video output to session")
             self.session.addOutput_(self.output)
+            connection = self.output.connectionWithMediaType_(AVF.AVMediaTypeVideo)
+            if connection is None:
+                raise RuntimeError("Video output connection was not created")
+            try:
+                if not connection.isEnabled():
+                    connection.setEnabled_(True)
+            except Exception:
+                pass
+            configure_connection_frame_rate(connection, fps=60.0)
+            logger.info(
+                "Video output configured: settings=%s connection_enabled=%s connection_active=%s",
+                self.output.videoSettings(),
+                safe_str(connection.isEnabled()) if hasattr(connection, "isEnabled") else "unknown",
+                safe_str(connection.isActive()) if hasattr(connection, "isActive") else "unknown",
+            )
             self.session.startRunning()
+            if not self.session.isRunning():
+                raise RuntimeError("AVCaptureSession did not start running")
             self.shared_state.capture_started = True
             self.connected = True
-            self.status_text = "iPhone capture: connected"
+            self.connected_wall_ts = time.time()
+            self.status_text = "iPhone capture: connected; waiting for video frames"
             self.device_text = f"iPhone device: {safe_str(device.localizedName())} | {safe_str(device.uniqueID())}"
+            logger.info("AVCaptureSession started")
         except Exception as exc:
+            logger.exception("Failed to start iPhone capture")
             self.connected = False
+            self.connected_wall_ts = None
             self.status_text = f"iPhone capture: error: {exc}"
-            self.shared_state.last_error = exc
+            self.shared_state.report_error(exc)
         finally:
             self.connecting = False
 
@@ -897,17 +1158,16 @@ class IphoneCaptureService:
         if self.session is not None and self.session.isRunning():
             self.session.stopRunning()
         self.session = None
+        self.input = None
         self.output = None
         self.delegate = None
         self.queue = None
         self.connected = False
         self.connecting = False
+        self.connected_wall_ts = None
         self.status_text = "iPhone capture: disconnected"
         self.device_text = "iPhone device: unknown"
-        self.shared_state.last_frame_shape = None
-        self.shared_state.last_fps = 0.0
-        self.shared_state.frames_total = 0
-        self.shared_state.start_ts = None
+        self.shared_state.reset_stream_stats()
 
     def start_recording(self, start_request_wall_ts: Optional[float] = None) -> VideoClipMetadata:
         if self.shared_state.last_frame_shape is None:
